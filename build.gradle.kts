@@ -59,6 +59,12 @@ fun getUncommittedSuffix(): String {
 }
 
 val gitVersionName: String get() {
+    // fork builds can pin the version name via appVerName in local.properties
+    // (e.g. to exactly match the installed official manager app, which the
+    // manager UI compares character-by-character to flag a version mismatch
+    // with a red status card)
+    localProperties.getProperty("appVerName")?.let { return it }
+
     val suffix = getUncommittedSuffix()
 
     return suffix.ifEmpty {

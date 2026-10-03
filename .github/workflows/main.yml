@@ -47,9 +47,11 @@ jobs:
           # fork build: no keystore secrets available, use the debug keystore.
           # the signing certificate is embedded into the zygote at build time
           # (overridden by zygote/official_manager_cert.der), so a debug-signed
-          # build pair is self-consistent. officialBuild=true only affects the
-          # version name style (oss-N instead of -<sha>) and nothing else.
+          # build pair is self-consistent. Pin the version name to the installed
+          # official manager app (oss-173) so the manager UI does not flag a
+          # version mismatch (red status card, exact string comparison).
           echo officialBuild=true >> local.properties
+          echo appVerName=oss-173 >> local.properties
 
       - name: Cache gradle
         uses: actions/cache@v6
