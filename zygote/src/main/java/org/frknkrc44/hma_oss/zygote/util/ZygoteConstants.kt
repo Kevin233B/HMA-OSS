@@ -6,6 +6,7 @@ object ZygoteConstants {
     const val RUNTIME_INIT_CLASS = "com.android.internal.os.RuntimeInit"
     const val ZYGOTE_INIT_CLASS = "com.android.internal.os.ZygoteInit"
     const val COMPUTER_ENGINE_CLASS = "com.android.server.pm.ComputerEngine"
+    const val RESOLVE_INTENT_HELPER_CLASS = "com.android.server.pm.ResolveIntentHelper"
     const val PACKAGE_MANAGER_SERVICE_CLASS = "com.android.server.pm.PackageManagerService"
     const val PMS_COMPUTER_TRACKER_CLASS = $$"com.android.server.pm.PackageManagerService$ComputerTracker"
     const val PMS_COMPUTER_ENGINE_CLASS = $$"com.android.server.pm.PackageManagerService$ComputerEngine"
