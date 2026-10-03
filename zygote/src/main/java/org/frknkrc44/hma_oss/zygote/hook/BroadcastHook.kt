@@ -43,7 +43,9 @@ class BroadcastHook : IFrameworkHook {
     // after hook. The funnel runs inside one binder call on the caller's
     // binder thread, so a per-thread LIFO stack is sufficient: nested calls
     // of the same thread unwind in order.
-    private val savedComponents = ThreadLocal.withInitial { ArrayDeque<Pair<Intent, ComponentName?>>() }
+    private val savedComponents = object : ThreadLocal<ArrayList<Pair<Intent, ComponentName?>>>() {
+        override fun initialValue(): ArrayList<Pair<Intent, ComponentName?>> = ArrayList()
+    }
 
     override fun load() {
         logI(TAG) { "Load hook" }
@@ -254,7 +256,7 @@ class BroadcastHook : IFrameworkHook {
         // hook restores the original component before anyone else can
         // observe the intent.
         intent.component = ComponentName(targetApp, UNRESOLVABLE_RECEIVER_CLASS)
-        savedComponents.get().addLast(intent to component)
+        savedComponents.get().add(intent to component)
 
         logD(TAG) { "@$methodName: resolution rewritten for $caller, target: $component" }
 
@@ -272,7 +274,10 @@ class BroadcastHook : IFrameworkHook {
         @Suppress("UNUSED_PARAMETER") frame: EmulatedStackFrame,
         @Suppress("UNUSED_PARAMETER") returnValue: ReturnValue,
     ) {
-        val saved = savedComponents.get().pollLast() ?: return
+        val stack = savedComponents.get()
+        if (stack.isEmpty()) return
+
+        val saved = stack.removeAt(stack.size - 1)
 
         // Restore before broadcastIntentLocked (or the binder query caller)
         // gets control back, so the BroadcastRecord and the finish callback
