@@ -45,9 +45,11 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         run: |
           # fork build: no keystore secrets available, use the debug keystore.
-          # the signing certificate is embedded into the zygote at build time,
-          # so a debug-signed manager apk + zygote pair is self-consistent.
-          echo officialBuild=false >> local.properties
+          # the signing certificate is embedded into the zygote at build time
+          # (overridden by zygote/official_manager_cert.der), so a debug-signed
+          # build pair is self-consistent. officialBuild=true only affects the
+          # version name style (oss-N instead of -<sha>) and nothing else.
+          echo officialBuild=true >> local.properties
 
       - name: Cache gradle
         uses: actions/cache@v6
