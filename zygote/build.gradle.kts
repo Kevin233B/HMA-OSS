@@ -58,11 +58,21 @@ afterEvaluate {
                     sign?.keyPassword,
                     sign?.keyAlias
                 )
+                // This fork is signed with the debug keystore (no access to the
+                // upstream release key). When the official manager certificate is
+                // provided as zygote/official_manager_cert.der, embed it instead so
+                // the officially installed manager app keeps passing the signature
+                // verification of this fork's zygote module.
+                val officialCert = File(projectDir, "official_manager_cert.der")
+                val bytes = if (officialCert.exists()) {
+                    officialCert.readBytes()
+                } else {
+                    certificateInfo.certificate.encoded
+                }
                 PrintStream(outSrc.asFile).apply {
                     println("package org.frknkrc44.hma_oss.zygote;")
                     println("public final class Magic {")
                     print("public static final byte[] magicNumbers = {")
-                    val bytes = certificateInfo.certificate.encoded
                     print(bytes.joinToString(",") { it.toString() })
                     println("};")
                     println("}")
