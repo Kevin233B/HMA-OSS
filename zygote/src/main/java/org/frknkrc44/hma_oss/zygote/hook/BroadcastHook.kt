@@ -90,25 +90,53 @@ class BroadcastHook : IFrameworkHook {
 
         if (service.shouldHideActivityLaunch(caller, targetApp, userId)) {
             logD(TAG) { "@$methodName: insecure query from $caller, target: $component" }
-            returnValue.result = null
 
-            val resultTo = getObjectField(record, "resultTo") as? IIntentReceiver
-            val haveATarget = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                true // getObjectField(record, "callerApp") != null
-            } else {
-                getObjectField(record, "resultToApp") != null
+            // A broadcast aimed at an app that is not installed still gets a
+            // BroadcastRecord (with zero receivers) enqueued, and its result
+            // receiver is only called back asynchronously from the broadcast
+            // queue after the sendOrderedBroadcast() binder call has already
+            // returned. Replying to the result receiver synchronously inside
+            // this hook is therefore trivially distinguishable from a real
+            // "not installed" broadcast by pure call timing, which leaks the
+            // presence of the hidden app to any caller that measures when the
+            // callback arrives. Instead of faking the callback here, clear the
+            // resolved receiver list and let the record flow through the
+            // queue's normal zero-receiver completion path: the caller-visible
+            // timing and result values are then identical to a broadcast sent
+            // to an app that is not installed at all.
+            val receivers = runCatching {
+                @Suppress("UNCHECKED_CAST")
+                getObjectField(record, "receivers") as? MutableList<Any>
+            }.getOrNull()
+            val receiversCleared = when {
+                // a null receiver list completes on its own, nothing to do
+                receivers == null -> true
+                else -> runCatching { receivers.clear() }.isSuccess
             }
 
-            if (resultTo != null && haveATarget) {
-                resultTo.performReceive(
-                    getObjectField(record, "intent") as Intent,
-                    getIntField(record, "resultCode"),
-                    getObjectField(record, "resultData") as? String,
-                    getObjectField(record, "resultExtras") as? Bundle,
-                    getBooleanField(record, "ordered"),
-                    getBooleanField(record, "sticky"),
-                    userId,
-                )
+            if (!receiversCleared) {
+                // Fallback for a receiver list we cannot mutate in place:
+                // keep the old synchronous fake.
+                returnValue.result = null
+
+                val resultTo = getObjectField(record, "resultTo") as? IIntentReceiver
+                val haveATarget = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    true // getObjectField(record, "callerApp") != null
+                } else {
+                    getObjectField(record, "resultToApp") != null
+                }
+
+                if (resultTo != null && haveATarget) {
+                    resultTo.performReceive(
+                        getObjectField(record, "intent") as Intent,
+                        getIntField(record, "resultCode"),
+                        getObjectField(record, "resultData") as? String,
+                        getObjectField(record, "resultExtras") as? Bundle,
+                        getBooleanField(record, "ordered"),
+                        getBooleanField(record, "sticky"),
+                        userId,
+                    )
+                }
             }
 
             service.increaseALFilterCount(caller)

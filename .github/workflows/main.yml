@@ -44,14 +44,10 @@ jobs:
       - name: Write key
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         run: |
-          echo officialBuild=true >> local.properties
-          echo storePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> local.properties
-          echo keyAlias='${{ secrets.ALIAS }}' >> local.properties
-          echo keyPassword='${{ secrets.ALIAS_KEY_PASSWORD }}' >> local.properties
-          echo fileDir=`pwd`/key.jks >> local.properties
-          echo crowdinProjectId='${{ secrets.CROWDIN_PROJECT_ID }}' >> local.properties
-          echo crowdinApiKey='${{ secrets.CROWDIN_LIST_MEMBERS_API_TOKEN }}' >> local.properties
-          echo "${{ secrets.KEY_STORE }}" | base64 --decode > key.jks
+          # fork build: no keystore secrets available, use the debug keystore.
+          # the signing certificate is embedded into the zygote at build time,
+          # so a debug-signed manager apk + zygote pair is self-consistent.
+          echo officialBuild=false >> local.properties
 
       - name: Cache gradle
         uses: actions/cache@v6
@@ -117,16 +113,3 @@ jobs:
             ${{ steps.buildModule.outputs.debugFile }}
             app/src/main/assets/translators.json
           tag_name: oss-${{ steps.buildModule.outputs.ossNum }}
-
-      - name: Post to channel
-        if: ${{ github.event_name != 'pull_request' && success() && github.ref == 'refs/heads/master' }}
-        env:
-          CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          COMMIT_URL: ${{ github.event.head_commit.url }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-        run: |
-          export release=${{ steps.buildModule.outputs.releaseFile }}
-          export debug=${{ steps.buildModule.outputs.debugFile }}
-          ESCAPED=`python3 -c 'import json,os,urllib.parse; msg = json.dumps(os.environ["COMMIT_MESSAGE"]); print(urllib.parse.quote(msg if len(msg) <= 1024 else json.dumps(os.environ["COMMIT_URL"])))'`
-          curl -v "https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup?chat_id=${CHANNEL_ID}&media=%5B%7B%22type%22:%22document%22,%20%22media%22:%22attach://release%22%7D,%7B%22type%22:%22document%22,%20%22media%22:%22attach://debug%22,%22caption%22:${ESCAPED}%7D%5D"  -F release="@$release" -F debug="@$debug"
