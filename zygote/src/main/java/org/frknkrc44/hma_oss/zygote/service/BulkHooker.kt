@@ -140,6 +140,64 @@ class BulkHooker {
         frame.setReturnValue(value.result)
     }
 
+    // A single transformer that runs the before logic, then the original
+    // function, then the after logic. The underlying hooker overwrites the
+    // target entry point on every registration (vmtools hookSwap reads the
+    // STATIC interpreter bridge as the old entry, never the currently
+    // installed trampoline), so a second registration for the same
+    // (class, method, arity) replaces the first one entirely instead of
+    // chaining: only the transformer that registered LAST on a given
+    // executable ever runs. Registering the before and after halves of a
+    // hook separately therefore silently drops the before half; before and
+    // after logic must run inside ONE transformer, which is what this
+    // wrapper is for.
+    internal fun hookWrap(
+        clazz: String,
+        methodName: String,
+        argumentCount: Int = PARAMETER_COUNT_UNKNOWN,
+        before: (methodName: String, frame: EmulatedStackFrame, returnValue: ReturnValue) -> Unit,
+        after: (methodName: String, frame: EmulatedStackFrame, returnValue: ReturnValue) -> Unit,
+    ) = addHook(clazz, methodName, argumentCount) { original, frame ->
+        val value = ReturnValue()
+
+        try {
+            before(methodName, frame, value)
+        } catch (it: Throwable) {
+            logE(ZygoteEntry.TAG, it) { it.message ?: "Unknown error on hook" }
+        }
+
+        if (!value.replace) {
+            try {
+                invokeExactCompat(clazz, methodName, original, frame, value)
+            } catch (it: Throwable) {
+                logD(ZygoteEntry.TAG, it) { it.message ?: "Unknown error on original function" }
+                value.throwable = it
+            }
+        }
+
+        if (!value.replace && value.throwable == null &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        ) {
+            value.result = frame.accessor().getValue(RETURN_VALUE_IDX)
+        }
+
+        if (value.throwable == null) {
+            try {
+                after(methodName, frame, value)
+            } catch (it: Throwable) {
+                logE(ZygoteEntry.TAG, it) { it.message ?: "Unknown error on hook" }
+            }
+        }
+
+        value.throwable?.let {
+            ServiceUtils.clearStackTraces(it)
+
+            throw it
+        }
+
+        frame.setReturnValue(value.result)
+    }
+
     private fun applyHook(
         clazz: String,
         element: HookElement,

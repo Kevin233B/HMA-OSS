@@ -106,23 +106,24 @@ class BroadcastHook : IFrameworkHook {
                 // real caller) and the direct query path (forSend = false)
                 // both end there, the 6-argument one only forwards to it.
                 // Register both so a ROM that only has one of the two is
-                // still covered; the Boolean guard below makes the
-                // forwarding overload inert, and a registration whose
-                // (class, method, arity) does not resolve is skipped
-                // silently by the hooker.
+                // still covered; the Boolean guard inside the before logic
+                // makes the forwarding overload inert, and a registration
+                // whose (class, method, arity) does not resolve is skipped
+                // silently by the hooker. The before and after halves MUST
+                // be registered as one hookWrap, never as separate
+                // hookBefore and hookAfter calls: the hooker overwrites the
+                // target entry point on every registration, so a second
+                // registration for the same (class, method, arity) replaces
+                // the first one entirely instead of chaining — separate
+                // before/after registrations silently drop the before half
+                // and the rewrite never runs.
                 intArrayOf(7, 6).forEach { argumentCount ->
-                    hookBefore(
+                    hookWrap(
                         clazz,
                         "queryIntentReceiversInternal",
                         argumentCount,
-                        hook = ::resolveReceiverQueryBefore,
-                    )
-
-                    hookAfter(
-                        clazz,
-                        "queryIntentReceiversInternal",
-                        argumentCount,
-                        hook = ::resolveReceiverQueryAfter,
+                        before = ::resolveReceiverQueryBefore,
+                        after = ::resolveReceiverQueryAfter,
                     )
                 }
 
