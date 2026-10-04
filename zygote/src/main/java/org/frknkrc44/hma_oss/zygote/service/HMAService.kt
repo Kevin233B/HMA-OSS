@@ -357,27 +357,27 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
     }
 
     fun increasePMFilterCount(callingUid: Int?, amount: Int = 1) = dataHolder.increaseFilterCount(
-        callingUid, amount, FilterHolder.FilterType.PACKAGE_MANAGER, ::writeFilterCount
+        callingUid, amount, FilterHolder.FilterType.PACKAGE_MANAGER, writeFilterCountHook
     )
 
     fun increasePMFilterCount(caller: String?, amount: Int = 1) = dataHolder.increaseFilterCount(
-        caller, amount, FilterHolder.FilterType.PACKAGE_MANAGER, ::writeFilterCount
+        caller, amount, FilterHolder.FilterType.PACKAGE_MANAGER, writeFilterCountHook
     )
 
     fun increaseALFilterCount(caller: String?, amount: Int = 1) = dataHolder.increaseFilterCount(
-        caller, amount, FilterHolder.FilterType.ACTIVITY_LAUNCH, ::writeFilterCount
+        caller, amount, FilterHolder.FilterType.ACTIVITY_LAUNCH, writeFilterCountHook
     )
 
     fun increaseInstallerFilterCount(caller: String?, amount: Int = 1) = dataHolder.increaseFilterCount(
-        caller, amount, FilterHolder.FilterType.INSTALLER, ::writeFilterCount
+        caller, amount, FilterHolder.FilterType.INSTALLER, writeFilterCountHook
     )
 
     fun increaseSettingsFilterCount(caller: String?, amount: Int = 1) = dataHolder.increaseFilterCount(
-        caller, amount, FilterHolder.FilterType.SETTINGS, ::writeFilterCount
+        caller, amount, FilterHolder.FilterType.SETTINGS, writeFilterCountHook
     )
 
     fun increaseOthersFilterCount(caller: String?, amount: Int = 1) = dataHolder.increaseFilterCount(
-        caller, amount, FilterHolder.FilterType.OTHERS, ::writeFilterCount
+        caller, amount, FilterHolder.FilterType.OTHERS, writeFilterCountHook
     )
 
     fun isHookEnabled(packageName: String?) = config.scope.containsKey(packageName)
@@ -560,6 +560,14 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
 
         writeFilterCount(true)
     }
+
+    // Cached write hook for the counter increments. A '::writeFilterCount'
+    // expression at a call site allocates and adapts a fresh
+    // function-reference object on every counter increment, and the
+    // increments run inside the receiver resolution funnel of a binder
+    // call, so that per-call allocation work is measurable in the
+    // caller's latency. Allocate the callable once instead.
+    private val writeFilterCountHook: () -> Unit = { writeFilterCount() }
 
     private fun writeFilterCount(force: Boolean = false) {
         if (force) {

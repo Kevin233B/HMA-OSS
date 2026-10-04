@@ -76,11 +76,11 @@ class HMAServiceDataHolder {
         if (caller == null || amount < 1) return
 
         synchronized(filterCountLock) {
-            if (!filterHolder.filterCounts.containsKey(caller)) {
-                filterHolder.filterCounts[caller] = FilterHolder.FilterCount()
-            }
-
-            val filterCount = filterHolder.filterCounts[caller]!!
+            // One map lookup on the fast path: the counter increments run
+            // inside the receiver resolution funnel of a binder call, so
+            // per-increment map work is measurable in the caller's latency.
+            val counts = filterHolder.filterCounts
+            val filterCount = counts[caller] ?: FilterHolder.FilterCount().also { counts[caller] = it }
             when (filterType) {
                 FilterHolder.FilterType.PACKAGE_MANAGER -> filterCount.packageManagerCount += amount
                 FilterHolder.FilterType.ACTIVITY_LAUNCH -> filterCount.activityLaunchCount += amount
