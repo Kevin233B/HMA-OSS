@@ -37,14 +37,27 @@ class BroadcastHook : IFrameworkHook {
         // misses, the very same map-miss the funnel performs for a
         // component that belongs to an app that is not installed.
         private const val UNRESOLVABLE_RECEIVER_CLASS = "#hma_oss_disabled_receiver"
+
+        // A package name that can never be installed: '#' is not a legal
+        // Android package name character, so the package lookup always
+        // misses, the very same map-miss the funnel performs for an app
+        // that is not installed.
+        private const val UNRESOLVABLE_PACKAGE = "#hma_oss_disabled"
     }
 
-    // Components rewritten by the funnel before hook and restored by the
-    // after hook. The funnel runs inside one binder call on the caller's
-    // binder thread, so a per-thread LIFO stack is sufficient: nested calls
-    // of the same thread unwind in order.
-    private val savedComponents = object : ThreadLocal<ArrayList<Pair<Intent, ComponentName?>>>() {
-        override fun initialValue(): ArrayList<Pair<Intent, ComponentName?>> = ArrayList()
+    // Cached per-target unresolvable receiver components: one allocation
+    // per target app for the process lifetime instead of one per funnel
+    // call, keeping the rewritten hot path allocation-free.
+    private val unresolvableReceiverComponents =
+        java.util.concurrent.ConcurrentHashMap<String, ComponentName>()
+
+    // Intent fields rewritten by the funnel before hook and restored by
+    // the after hook: the original component and the original package.
+    // The funnel runs inside one binder call on the caller's binder
+    // thread, so a per-thread LIFO stack is sufficient: nested calls of
+    // the same thread unwind in order.
+    private val savedTargets = object : ThreadLocal<ArrayList<Triple<Intent, ComponentName?, String?>>>() {
+        override fun initialValue(): ArrayList<Triple<Intent, ComponentName?, String?>> = ArrayList()
     }
 
     override fun load() {
@@ -92,14 +105,16 @@ class BroadcastHook : IFrameworkHook {
             // for a not-installed target. A paired statistical timing probe
             // (candidate vs. known-missing control, many samples) can
             // extract that bias. Instead of paying for resolution and
-            // undoing it, rewrite the component (or add one to a
-            // package-only intent) to a same-package name that can never
-            // resolve: the funnel then runs its native "not installed"
-            // map-miss instructions, bit-for-bit the same work as for a
-            // genuinely absent app. The after hook restores the original
-            // component before control returns to broadcastIntentLocked (or
-            // the binder query caller), so the record, the finish callback
-            // and every other observer see the original intent untouched.
+            // undoing it, rewrite the intent to a name that can never
+            // resolve — the component of an explicit intent, or the package
+            // of a package-directed one, never adding a component where the
+            // not-installed native path would not have one — so the funnel
+            // runs its native "not installed" map-miss instructions,
+            // bit-for-bit the same work as for a genuinely absent app. The
+            // after hook restores the original fields before control returns
+            // to broadcastIntentLocked (or the binder query caller), so the
+            // record, the finish callback and every other observer see the
+            // original intent untouched.
             setOf(RESOLVE_INTENT_HELPER_CLASS, COMPUTER_ENGINE_CLASS).forEach { clazz ->
                 // The 7-argument overload is the shared funnel: the
                 // broadcast path (forSend = true, filterCallingUid = the
@@ -252,12 +267,31 @@ class BroadcastHook : IFrameworkHook {
 
         if (!service.shouldHideActivityLaunch(caller, targetApp, callingUserId)) return
 
-        // Rewrite to a component that can never resolve: the funnel then
-        // performs its native miss path for the whole resolution. The after
-        // hook restores the original component before anyone else can
-        // observe the intent.
-        intent.component = ComponentName(targetApp, UNRESOLVABLE_RECEIVER_CLASS)
-        savedComponents.get().add(intent to component)
+        // Rewrite the intent so the funnel performs its native
+        // not-installed miss for the whole resolution, while keeping the
+        // native instruction path identical to a genuinely absent app:
+        // - an explicit-component intent is rewritten in place: both the
+        //   hidden probe and an absent-app probe take the same component
+        //   branch of the funnel and pay the same resolver map miss;
+        // - a package-directed intent must NOT gain a component: that
+        //   would steer the funnel into the explicit-component branch,
+        //   which a probe of an absent package never takes (it stays on
+        //   the package branch, a plain package map miss). Rewrite the
+        //   package instead: the funnel then performs the same
+        //   package-branch miss it performs for an app that is not
+        //   installed, instruction for instruction.
+        // The after hook restores the original fields before anyone else
+        // can observe the intent.
+        val originalPackage = intent.`package`
+        if (component != null) {
+            intent.component =
+                unresolvableReceiverComponents.computeIfAbsent(targetApp) {
+                    ComponentName(it, UNRESOLVABLE_RECEIVER_CLASS)
+                }
+        } else {
+            intent.`package` = UNRESOLVABLE_PACKAGE
+        }
+        savedTargets.get().add(Triple(intent, component, originalPackage))
 
         logD(TAG) { "@$methodName: resolution rewritten for $caller, target: $component" }
 
@@ -275,15 +309,16 @@ class BroadcastHook : IFrameworkHook {
         @Suppress("UNUSED_PARAMETER") frame: EmulatedStackFrame,
         @Suppress("UNUSED_PARAMETER") returnValue: ReturnValue,
     ) {
-        val stack = savedComponents.get()
+        val stack = savedTargets.get()
         if (stack.isEmpty()) return
 
         val saved = stack.removeAt(stack.size - 1)
 
         // Restore before broadcastIntentLocked (or the binder query caller)
         // gets control back, so the BroadcastRecord and the finish callback
-        // see the original component.
+        // see the original component and package.
         saved.first.component = saved.second
+        saved.first.`package` = saved.third
     }
 
     private fun changeUsbStateBroadcast(intent: Intent) {

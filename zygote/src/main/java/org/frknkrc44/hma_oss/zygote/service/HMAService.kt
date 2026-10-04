@@ -93,6 +93,12 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
 
     private val configLock = Any()
     private val loggerLock = Any()
+
+    // Set by the counting hot path when filter counts changed and flushed
+    // to disk at most once every 10 seconds by the writer thread started in
+    // init. See writeFilterCount for why the write must not run inline.
+    @Volatile
+    private var filterCountDirty = false
     val systemApps = mutableSetOf<String>()
     private val frameworkHooks = mutableSetOf<IFrameworkHook>()
     internal var appUid = 0
@@ -113,6 +119,29 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
         saveModuleStatus()
         UserService.service = this
         loadFilterCount()
+
+        // Flush filter count changes to disk in the background. Counter
+        // increments run inside the receiver resolution funnel of a binder
+        // call; an inline JSON write there would be directly observable in
+        // the caller's call latency and its outlier distribution.
+        Thread {
+            while (true) {
+                try {
+                    Thread.sleep(10_000)
+                    if (filterCountDirty) {
+                        filterCountDirty = false
+                        writeFilterCountFile()
+                    }
+                } catch (cause: Throwable) {
+                    // Never let the writer die: the next tick retries, and
+                    // the next counter increment re-marks the flag anyway.
+                    // A write failure itself is already logged inside
+                    // writeFilterCountFile.
+                    logW(TAG, cause) { "Filter count writer tick failed" }
+                }
+            }
+        }.apply { isDaemon = true; name = "hma-filter-count-writer" }.start()
+
         loadConfig()
 
         appUid = findAndVerifyAppSignature(pms)
@@ -533,13 +562,28 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
     }
 
     private fun writeFilterCount(force: Boolean = false) {
+        if (force) {
+            // Config sync: write inline so the file matches the new config
+            // immediately.
+            writeFilterCountFile()
+        } else {
+            // Hot path (a counter increment just ran): never write inline.
+            // The old every-100th-increment inline write put JSON
+            // serialization and disk I/O under configLock inside the
+            // receiver resolution funnel, which both slowed every rewrite
+            // in the binder call's latency and stamped a one-in-N
+            // multi-millisecond outlier onto the rewritten population only
+            // — a distribution-shape oracle for anyone timing the call.
+            // Mark dirty instead; the writer thread flushes it off the hot
+            // path.
+            filterCountDirty = true
+        }
+    }
+
+    private fun writeFilterCountFile() {
         if (!ensureManagerWorkModeOK()) return
 
         synchronized(configLock) {
-            if (!force && dataHolder.filterHolder.totalCount % 100 != 0) {
-                return
-            }
-
             try {
                 ensureFileIsRW(filterCountFile, true)
                 filterCountFile.writeText(detailedFilterStats)
