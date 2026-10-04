@@ -296,11 +296,14 @@ class BroadcastHook : IFrameworkHook {
         logD(TAG) { "@$methodName: resolution rewritten for $caller, target: $component" }
 
         // This is the single count for the rewritten path: the enqueue hook
-        // only counts when it had receivers to clear.
+        // only counts when it had receivers to clear. The increment is
+        // deferred to a ring folded by a background thread: even the
+        // optimized inline increment (lock + map update) is measurable
+        // inside the resolution funnel of the caller's own binder call.
         if (forSend) {
-            service.increaseALFilterCount(caller)
+            service.countALDeferred(caller)
         } else {
-            service.increasePMFilterCount(caller, 1)
+            service.countPMDeferred(caller)
         }
     }
 

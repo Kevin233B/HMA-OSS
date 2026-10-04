@@ -99,6 +99,21 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
     // init. See writeFilterCount for why the write must not run inline.
     @Volatile
     private var filterCountDirty = false
+
+    // Deferred counter ring: the funnel counter increments run inside the
+    // receiver resolution funnel of the caller's own binder call, so even
+    // the optimized inline increment (lock + map update) is measurable in
+    // the caller's latency. The funnel hot path only appends (caller,
+    // filterType) to this ring — a lock and two array stores; the writer
+    // thread folds the ring into the real per-caller counters at most 10
+    // seconds later, off the caller's path. Entries beyond the ring
+    // capacity are dropped (filter counts are advisory statistics).
+    private val deferredCountLock = Any()
+    private val deferredCountCallers = arrayOfNulls<String>(4096)
+    private val deferredCountTypes = IntArray(4096)
+    private var deferredCountCursor = 0
+    @Volatile
+    private var deferredCountDropped = 0
     val systemApps = mutableSetOf<String>()
     private val frameworkHooks = mutableSetOf<IFrameworkHook>()
     internal var appUid = 0
@@ -128,6 +143,10 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
             while (true) {
                 try {
                     Thread.sleep(10_000)
+                    // Fold deferred funnel counter entries first: the fold
+                    // marks the counts dirty, and the flush below persists
+                    // them in the same tick.
+                    drainDeferredCounts()
                     if (filterCountDirty) {
                         filterCountDirty = false
                         writeFilterCountFile()
@@ -536,6 +555,11 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
     fun writeConfig(json: String) {
         if (!ensureManagerWorkModeOK()) return
 
+        // Fold any deferred counts before the scope cleanup below drops
+        // out-of-scope callers, so a deferred entry cannot resurrect a
+        // counter that the cleanup just removed.
+        drainDeferredCounts()
+
         synchronized(configLock) {
             try {
                 val newConfig = JsonConfig.parse(json)
@@ -568,6 +592,54 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
     // call, so that per-call allocation work is measurable in the
     // caller's latency. Allocate the callable once instead.
     private val writeFilterCountHook: () -> Unit = { writeFilterCount() }
+
+    // Deferred counting API for the resolution funnel hot path: enqueue
+    // only, one lock acquisition and two array stores, no map work and no
+    // file-dirty write. drainDeferredCounts() folds the entries into the
+    // real per-caller counters.
+    fun countALDeferred(caller: String) =
+        countFilterDeferred(caller, FilterHolder.FilterType.ACTIVITY_LAUNCH)
+
+    fun countPMDeferred(caller: String) =
+        countFilterDeferred(caller, FilterHolder.FilterType.PACKAGE_MANAGER)
+
+    private fun countFilterDeferred(caller: String, filterType: FilterHolder.FilterType) {
+        synchronized(deferredCountLock) {
+            if (deferredCountCursor >= deferredCountCallers.size) {
+                deferredCountDropped++
+                return
+            }
+
+            deferredCountCallers[deferredCountCursor] = caller
+            deferredCountTypes[deferredCountCursor] = filterType.ordinal
+            deferredCountCursor++
+        }
+    }
+
+    private fun drainDeferredCounts() {
+        val entries = synchronized(deferredCountLock) {
+            if (deferredCountCursor == 0) return
+
+            val out = ArrayList<Pair<String, FilterHolder.FilterType>>(deferredCountCursor)
+            for (i in 0 until deferredCountCursor) {
+                val caller = deferredCountCallers[i] ?: continue
+                out.add(caller to FilterHolder.FilterType.values()[deferredCountTypes[i]])
+                deferredCountCallers[i] = null
+            }
+            deferredCountCursor = 0
+            out
+        }
+
+        for ((caller, filterType) in entries) {
+            dataHolder.increaseFilterCount(caller, 1, filterType, writeFilterCountHook)
+        }
+
+        val dropped = deferredCountDropped
+        if (dropped > 0) {
+            deferredCountDropped = 0
+            logW(TAG) { "Dropped $dropped deferred filter counts (ring full)" }
+        }
+    }
 
     private fun writeFilterCount(force: Boolean = false) {
         if (force) {
