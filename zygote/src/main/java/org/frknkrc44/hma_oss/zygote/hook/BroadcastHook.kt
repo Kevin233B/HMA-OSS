@@ -265,7 +265,10 @@ class BroadcastHook : IFrameworkHook {
         val callingUserId = getUserFromCallingUid(callingUid)
         val caller = getCallingApps(pms, callingUid).firstOrNull { service.isHookEnabled(it) } ?: return
 
-        if (!service.shouldHideActivityLaunch(caller, targetApp, callingUserId)) return
+        // Cached decision: the full decision walk is config-shape
+        // dependent, and either side of a paired probe would pay a
+        // different, extractable latency for it.
+        if (!service.shouldHideActivityLaunchCached(callingUid, caller, targetApp, callingUserId)) return
 
         // Rewrite the intent so the funnel performs its native
         // not-installed miss for the whole resolution, while keeping the

@@ -66,12 +66,17 @@ import java.io.File
 import java.lang.reflect.Modifier
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.io.path.Path
 
 class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
 
     companion object {
         private const val TAG = "HMA-Service"
+        private const val DECISION_CACHE_CAP = 4096
+        private const val DEFERRED_COUNT_CAPACITY = 4096
     }
 
     @Volatile
@@ -103,17 +108,28 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
     // Deferred counter ring: the funnel counter increments run inside the
     // receiver resolution funnel of the caller's own binder call, so even
     // the optimized inline increment (lock + map update) is measurable in
-    // the caller's latency. The funnel hot path only appends (caller,
-    // filterType) to this ring — a lock and two array stores; the writer
-    // thread folds the ring into the real per-caller counters at most 10
-    // seconds later, off the caller's path. Entries beyond the ring
-    // capacity are dropped (filter counts are advisory statistics).
-    private val deferredCountLock = Any()
-    private val deferredCountCallers = arrayOfNulls<String>(4096)
-    private val deferredCountTypes = IntArray(4096)
-    private var deferredCountCursor = 0
-    @Volatile
-    private var deferredCountDropped = 0
+    // the caller's latency. The funnel hot path only reserves a slot with
+    // one atomic getAndIncrement and stores the (caller, filterType) pair;
+    // the writer thread folds the ring into the real per-caller counters
+    // at most 10 seconds later, off the caller's path. Entries beyond the
+    // ring capacity are dropped (filter counts are advisory statistics).
+    // Writers never take a lock: two concurrent writers always get
+    // distinct slots from the atomic cursor. Only the drains are
+    // serialized, by deferredCountDrainLock. A drain folds a snapshot of
+    // the cursor's low entries and then resets the cursor with a CAS
+    // against the snapshot: if a writer appended since, the CAS fails and
+    // its entries simply stay for the next drain. A writer preempted
+    // between its slot reservation and its store can land its store after
+    // the reset; that one entry is folded or overwritten by a later drain
+    // — a microsecond advisory-count race window. An overflowed cursor
+    // (writers ran past the capacity) is force-reset instead: those
+    // writers stored nothing, so nothing is lost, and the ring recovers
+    // on the next tick.
+    private val deferredCountCallers = arrayOfNulls<String>(DEFERRED_COUNT_CAPACITY)
+    private val deferredCountTypes = IntArray(DEFERRED_COUNT_CAPACITY)
+    private val deferredCountCursor = AtomicLong(0)
+    private val deferredCountDropped = AtomicInteger(0)
+    private val deferredCountDrainLock = Any()
     val systemApps = mutableSetOf<String>()
     private val frameworkHooks = mutableSetOf<IFrameworkHook>()
     internal var appUid = 0
@@ -505,6 +521,42 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
         return false
     }
 
+    // Cached hide decisions for the resolution funnel hot path. The full
+    // decision walks the caller's app config, the webview and default
+    // browser lookups, template and preset app lists, and the cost of the
+    // walk depends on which side of each collection the target lands on —
+    // an asymmetric, config-shape-dependent latency that a paired probe
+    // can extract. With the cache both sides of a comparison pay the same
+    // two map lookups instead. Keyed by calling uid, so the same package
+    // running under two users never shares an entry. Cleared on every
+    // config sync (the same envelope as dataHolder.clearUidCache below).
+    // The per-uid map is bounded: filled past the cap it is cleared and
+    // repopulated, so a caller fuzzing endless distinct targets cannot
+    // grow it unboundedly (repopulating costs them one full decision per
+    // unique target, and the filter counts show the fuzzing).
+    private val shouldHideActivityLaunchCache =
+        ConcurrentHashMap<Int, ConcurrentHashMap<String, Boolean>>()
+
+    fun shouldHideActivityLaunchCached(
+        callingUid: Int,
+        caller: String?,
+        query: String?,
+        userId: Int,
+    ): Boolean {
+        if (query == null) return shouldHideActivityLaunch(caller, query, userId)
+
+        val perTarget = shouldHideActivityLaunchCache.computeIfAbsent(callingUid) { ConcurrentHashMap() }
+        perTarget[query]?.let { return it }
+
+        val decision = shouldHideActivityLaunch(caller, query, userId)
+
+        if (perTarget.size >= DECISION_CACHE_CAP) {
+            perTarget.clear()
+        }
+        perTarget[query] = decision
+        return decision
+    }
+
     fun shouldHideInstallationSource(caller: String?, query: String?, callingUser: Int): Int {
         if (caller == null || query == null) return Constants.FAKE_INSTALLATION_SOURCE_DISABLED
         if (caller == BuildConfig.APP_PACKAGE_NAME) return Constants.FAKE_INSTALLATION_SOURCE_DISABLED
@@ -572,6 +624,7 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
                 ensureFileIsRW(configFile, true)
                 configFile.writeText(json)
                 dataHolder.clearUidCache()
+                shouldHideActivityLaunchCache.clear()
 
                 // remove filter counts for apps if they are not in config
                 dataHolder.filterHolder
@@ -604,29 +657,38 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
         countFilterDeferred(caller, FilterHolder.FilterType.PACKAGE_MANAGER)
 
     private fun countFilterDeferred(caller: String, filterType: FilterHolder.FilterType) {
-        synchronized(deferredCountLock) {
-            if (deferredCountCursor >= deferredCountCallers.size) {
-                deferredCountDropped++
-                return
-            }
-
-            deferredCountCallers[deferredCountCursor] = caller
-            deferredCountTypes[deferredCountCursor] = filterType.ordinal
-            deferredCountCursor++
+        val idx = deferredCountCursor.getAndIncrement()
+        if (idx >= DEFERRED_COUNT_CAPACITY) {
+            deferredCountDropped.incrementAndGet()
+            return
         }
+
+        deferredCountCallers[idx.toInt()] = caller
+        deferredCountTypes[idx.toInt()] = filterType.ordinal
     }
 
     private fun drainDeferredCounts() {
-        val entries = synchronized(deferredCountLock) {
-            if (deferredCountCursor == 0) return
+        val entries = synchronized(deferredCountDrainLock) {
+            val raw = deferredCountCursor.get()
+            if (raw == 0L) return
 
-            val out = ArrayList<Pair<String, FilterHolder.FilterType>>(deferredCountCursor)
-            for (i in 0 until deferredCountCursor) {
+            val n = minOf(raw, DEFERRED_COUNT_CAPACITY.toLong()).toInt()
+            val out = ArrayList<Pair<String, FilterHolder.FilterType>>(n)
+            for (i in 0 until n) {
                 val caller = deferredCountCallers[i] ?: continue
                 out.add(caller to FilterHolder.FilterType.values()[deferredCountTypes[i]])
                 deferredCountCallers[i] = null
             }
-            deferredCountCursor = 0
+
+            if (raw <= DEFERRED_COUNT_CAPACITY.toLong()) {
+                // Quiet drain: reset only if no writer appended since the
+                // snapshot; their entries stay for the next drain.
+                deferredCountCursor.compareAndSet(raw, 0L)
+            } else {
+                // Overflow: the writers past the capacity stored nothing,
+                // so a plain reset loses nothing and recovers the ring.
+                deferredCountCursor.set(0L)
+            }
             out
         }
 
@@ -634,9 +696,9 @@ class HMAService(val pms: IPackageManager, val pmn: Any?) : IHMAService.Stub() {
             dataHolder.increaseFilterCount(caller, 1, filterType, writeFilterCountHook)
         }
 
-        val dropped = deferredCountDropped
+        val dropped = deferredCountDropped.get()
         if (dropped > 0) {
-            deferredCountDropped = 0
+            deferredCountDropped.set(0)
             logW(TAG) { "Dropped $dropped deferred filter counts (ring full)" }
         }
     }
